@@ -5,6 +5,8 @@ export const config = { matcher: "/:path*" };
 
 export default function middleware(request) {
   const password = process.env.UI_PASSWORD;
+  // Los previews de cada branch ya piden el login de Vercel y no tienen UI_PASSWORD
+  if (!password && process.env.VERCEL_ENV === "preview") return next();
   const auth = request.headers.get("authorization") || "";
   const [scheme, encoded] = auth.split(" ");
   if (password && scheme === "Basic" && encoded) {
