@@ -17,7 +17,10 @@
     "historial_dias": 14,
     "gran_descuento": 0.5,
     "nuevo_vs_pasillo": 0.2,
-    "realertar_si_baja": 0.05
+    "realertar_si_baja": 0.05,
+    "oferta_real_baja": 0.15,
+    "oferta_permanente_dias": 7,
+    "oferta_min_historial_dias": 7
   },
   "notify": {
     "macos": true,

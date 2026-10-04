@@ -19,7 +19,7 @@ TITLES = {
     "descuento_extremo": "Descuento extremo",
     "vs_otras_tiendas": "Más barato que en otras tiendas",
     "promo_usuario_nuevo": "Promo usuario nuevo",
-    "gran_descuento": "Oferta fuerte",
+    "gran_descuento": "Oferta real fuerte",
     "nuevo_vs_pasillo": "Producto nuevo muy barato para su góndola",
 }
 MAX_LINES = 6

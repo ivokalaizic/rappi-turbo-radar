@@ -25,7 +25,7 @@ aprendiendo desarrollo: explicá los pasos de git/deploy en castellano y sin jer
 ## Flujo de cambios
 
 1. Branch nueva desde `main` (nunca commitear directo en `main`).
-2. Editar y probar local: `python3 ui.py`, `python3 -m turbo run`, o la UI con una copia de la base
+2. Editar, correr los tests (`python3 -m unittest`; corren también en cada PR) y probar local: `python3 ui.py`, `python3 -m turbo run`, o la UI con una copia de la base
    (`python3 ui.py --db copia.db`).
 3. Commit con mensaje en castellano, push, Pull Request. El dueño revisa y hace el merge.
 4. Un tema por commit/PR.

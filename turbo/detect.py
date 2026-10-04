@@ -21,7 +21,12 @@ DEFAULT_RULES = {
     "nuevo_vs_pasillo": 0.2,
     "historial_dias": 14,
     "realertar_si_baja": 0.05,
+    # Clasificación de descuentos (ver offer_status)
+    "oferta_permanente_dias": 7,
+    "oferta_min_historial_dias": 7,
+    "oferta_real_baja": 0.15,
 }
+SAME_PRICE = 0.02  # reajustes de ±2 % cuentan como el mismo precio
 MIN_COMPARABLES = 8  # productos del mismo sub-pasillo y unidad para comparar precio por unidad
 
 _UNITS = {"g": ("g", 1), "gr": ("g", 1), "kg": ("g", 1000),
@@ -67,6 +72,33 @@ def subaisle_reference(idx: dict, p: dict) -> tuple[float, int] | None:
     return others[len(others) // 10] * q[1], len(others)
 
 
+def offer_status(rows, rules: dict, now: int) -> dict:
+    """¿El precio actual es una oferta de verdad? Compara contra lo que costó antes, no contra el
+    precio tachado que pone Rappi (que puede estar inflado para aparentar un descuento).
+
+    `rows`: cambios de precio (ts, price, global_offer, in_stock) ordenados; el último es el estado
+    actual. Devuelve {"status", "since", "ref_price"}:
+    - "real": hace poco bajó al menos `oferta_real_baja` respecto de su precio habitual previo.
+    - "inflado": cuesta lo mismo hace `oferta_permanente_dias` o más, o no es más barato que antes.
+    - "sin_historial": lo vemos hace muy poco para saber.
+    """
+    day = 86400
+    cur = rows[-1]["price"]
+    i = len(rows) - 1
+    while i > 0 and cur > 0 and abs(rows[i - 1]["price"] - cur) / cur <= SAME_PRICE:
+        i -= 1
+    since = rows[i]["ts"]
+    if now - since >= rules["oferta_permanente_dias"] * day:
+        return {"status": "inflado", "since": since, "ref_price": None}
+    if i == 0 or since - rows[0]["ts"] < rules["oferta_min_historial_dias"] * day:
+        return {"status": "sin_historial", "since": since, "ref_price": None}
+    ref = db.typical_from_changes(rows[:i + 1], rules["historial_dias"], since)
+    if ref is None:
+        return {"status": "sin_historial", "since": since, "ref_price": None}
+    status = "real" if cur <= ref * (1 - rules["oferta_real_baja"]) else "inflado"
+    return {"status": status, "since": since, "ref_price": ref}
+
+
 def product_url(name: str, store_id) -> str:
     # La ficha /p/{slug}-{master_product_id} es genérica: Rappi elige la tienda (ej. Coto, que puede
     # cancelar por error de precio). La web no tiene URL directa de producto dentro de una tienda,
@@ -75,10 +107,12 @@ def product_url(name: str, store_id) -> str:
 
 
 def check(p: dict, typical: float | None, median: float | None, n_stores: int,
-          rules: dict, include_new_user_promos: bool, aisle_ref: tuple | None = None) -> list[dict]:
+          rules: dict, include_new_user_promos: bool, aisle_ref: tuple | None = None,
+          offer: dict | None = None) -> list[dict]:
     """Reglas que dispara un producto. Cada hallazgo: rule, ref_price, ratio, detail.
     `typical` = precio habitual en la tienda; `median` = mediana en otras `n_stores` tiendas;
-    `aisle_ref` = (precio de referencia, n) de su sub-pasillo, ver subaisle_reference."""
+    `aisle_ref` = (precio de referencia, n) de su sub-pasillo, ver subaisle_reference;
+    `offer` = offer_status del producto."""
     price, real = p["price"], p["real_price"]
 
     if p["global_offer"]:
@@ -102,9 +136,12 @@ def check(p: dict, typical: float | None, median: float | None, n_stores: int,
     # 3. Descuento extremo declarado por la propia Rappi (precio tachado)
     if real > 0 and price / real <= rules["descuento_extremo"]:
         hits.append({"rule": "descuento_extremo", "ref_price": real, "ratio": price / real, "detail": ""})
-    # 3b. Oferta fuerte: no es un error, pero vale la pena enterarse
-    elif real > 0 and rules.get("gran_descuento") and price / real <= rules["gran_descuento"]:
-        hits.append({"rule": "gran_descuento", "ref_price": real, "ratio": price / real, "detail": ""})
+    # 3b. Oferta fuerte: no es un error, pero vale la pena enterarse. Solo si es una oferta real:
+    #     un tachado alto sobre el precio de siempre no es oferta.
+    elif (real > 0 and rules.get("gran_descuento") and price / real <= rules["gran_descuento"]
+          and offer and offer["status"] == "real"):
+        hits.append({"rule": "gran_descuento", "ref_price": real, "ratio": price / real,
+                     "detail": f"antes ${offer['ref_price']:,.0f}"})
 
     # 4. Mucho más barato que el mismo producto en otras tiendas Turbo
     if median and price / median <= rules["vs_otras_tiendas"]:
@@ -129,10 +166,12 @@ def evaluate(conn, changed: list[dict], rules: dict, include_new_user_promos: bo
     for p in changed:
         if not p["in_stock"]:
             continue  # la alerta vigente (si hay) sigue abierta: puede volver con el mismo precio
-        typical = median = aisle_ref = None
+        typical = median = aisle_ref = offer = None
         n = 0
         if not p["global_offer"]:
-            typical = db.typical_price(conn, p["store_id"], p["product_id"], rules["historial_dias"], now)
+            rows = db.price_rows(conn, p["store_id"], p["product_id"], now)
+            typical = db.typical_from_changes(rows, rules["historial_dias"], now)
+            offer = offer_status(rows, rules, now) if rows else None
             median, n = db.other_stores_median(conn, p["master_product_id"], p["store_id"])
             if typical is None:
                 if idx is None:
@@ -146,7 +185,7 @@ def evaluate(conn, changed: list[dict], rules: dict, include_new_user_promos: bo
             "name": p["name"],
             "url": product_url(p["name"], p["store_id"]),
         }
-        hits = check(p, typical, median, n, rules, include_new_user_promos, aisle_ref)
+        hits = check(p, typical, median, n, rules, include_new_user_promos, aisle_ref, offer)
         db.close_alerts(conn, p["store_id"], p["product_id"], p["price"], {h["rule"] for h in hits},
                         rules["realertar_si_baja"])
         findings += [f for f in ({**base, **h} for h in hits) if db.save_alert(conn, f, rules["realertar_si_baja"])]

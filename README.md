@@ -38,12 +38,25 @@ la oferta terminó (el precio subió) y más adelante vuelve.
 | `caida_vs_historial` | precio ≤ X × precio habitual (el que más tiempo tuvo en los últimos `historial_dias`) | 0.5 |
 | `descuento_extremo` | precio ≤ X × precio de lista (tachado) | 0.2 |
 | `vs_otras_tiendas` | precio ≤ X × mediana del mismo producto en otras tiendas Turbo | 0.5 |
-| `gran_descuento` | oferta fuerte (no es error): precio ≤ X × precio de lista | 0.5 |
+| `gran_descuento` | oferta fuerte **y real** (no es error): precio ≤ X × precio de lista, solo si la oferta es ✅ real (ver abajo) | 0.5 |
 | `nuevo_vs_pasillo` | producto **sin historial** (nuevo): precio por kg/L ≤ X × el de los más baratos (percentil 10) de su sub-pasillo | 0.2 |
 
 `caida_vs_historial` necesita historia propia; `nuevo_vs_pasillo` cubre a los productos nuevos. Solo usa
 peso y volumen (las "Und" no son comparables) y sub-pasillos con 8+ productos. Con 0.2 no dispara con
 ningún producto del catálogo actual y detecta aproximadamente la mitad de los precios con un cero de menos.
+
+### ¿El descuento es de verdad?
+
+Rappi a veces infla el precio tachado para que el precio de siempre parezca una oferta. Por eso cada
+descuento se clasifica contra **nuestro propio historial**, no contra el tachado (`detect.offer_status`):
+
+| Etiqueta | Cuándo | Parámetro |
+|---|---|---|
+| ✅ Oferta real | bajó hace poco al menos X respecto de su precio habitual previo | `oferta_real_baja` = 0.15 |
+| 🎭 Descuento inflado | cuesta lo mismo hace X días o más (es su precio normal), o no bajó respecto de antes | `oferta_permanente_dias` = 7 |
+| ⏳ Sin historial | lo vemos hace menos de X días: todavía no se sabe | `oferta_min_historial_dias` = 7 |
+
+Reajustes de ±2 % cuentan como el mismo precio. La clasificación mejora sola a medida que se junta historial.
 
 Productos sin stock no alertan. Los que **desaparecen del catálogo** (Rappi saca lo que se queda sin
 stock) se marcan sin stock en la primera corrida completa en que no vienen; si vuelven, se evalúan de nuevo.
@@ -51,6 +64,10 @@ stock) se marcan sin stock en la primera corrida completa en que no vienen; si v
 **Promos para usuarios nuevos**: los productos con "Máx. 1 Ud." (p. ej. palta o huevos a $1) son promos
 de bienvenida que **no aplican a cuentas existentes** (verificado con una cuenta real). Se excluyen
 salvo que pongas `"include_new_user_promos": true`.
+
+## Tests
+
+`python3 -m unittest` (también corren solos en GitHub en cada Pull Request).
 
 ## Avisos (`config.json` → `notify`)
 

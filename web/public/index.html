@@ -225,11 +225,18 @@ const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "
 const RULES = {
   precio_absurdo: "Precio absurdo", caida_vs_historial: "Bajó vs. su precio habitual",
   descuento_extremo: "Descuento extremo", vs_otras_tiendas: "Más barato que en otras tiendas",
-  promo_usuario_nuevo: "Promo usuario nuevo", gran_descuento: "Oferta fuerte",
+  promo_usuario_nuevo: "Promo usuario nuevo", gran_descuento: "Oferta real fuerte",
   nuevo_vs_pasillo: "Nuevo, muy barato para su góndola",
 };
 const weird = p => p.flags.some(f => f.rule !== "gran_descuento");
 const deal = p => p.flags.some(f => f.rule === "gran_descuento");
+// ¿El descuento es de verdad? Lo decide offer_status (turbo/detect.py) con el historial propio.
+const OFFER = {
+  real: ["b-disc", "✅ Oferta real", "Bajó hace poco respecto de lo que costaba antes."],
+  inflado: ["b-warn", "🎭 Descuento inflado", "Es su precio de siempre: el tachado está inflado."],
+  sin_historial: ["b-muted", "⏳ Sin historial", "Lo vemos hace muy poco para saber si es una oferta real."],
+};
+const offerOf = p => p.discount > 0 && p.offer ? p.offer.status : null;
 let DATA = null, VIEW = "flagged", PAGE = 120, SHOWN = PAGE;
 
 function show(id) {
@@ -350,6 +357,8 @@ function filtered() {
     if (VIEW === "flagged" && !weird(p)) return false;
     if (VIEW === "deals" && !deal(p)) return false;
     if (VIEW === "discount" && !(p.discount > 0)) return false;
+    if (VIEW === "real" && offerOf(p) !== "real") return false;
+    if (VIEW === "inflado" && offerOf(p) !== "inflado") return false;
     if (VIEW === "alerts" && !p.alerts.length) return false;
     if (VIEW === "changed" && !(p.prev_price != null && p.price < p.prev_price)) return false;
     if (stock && !p.in_stock) return false;
@@ -380,8 +389,10 @@ function render() {
   const n = f => all.filter(p => f(p) && (!stock || p.in_stock)).length;
   const kpis = [
     ["flagged", n(weird), "Precio sospechoso"],
-    ["deals", n(deal), `Ofertas fuertes (≥ ${Math.round((1 - DATA.rules.gran_descuento) * 100)} %)`],
-    ["discount", n(p => p.discount > 0), "En descuento"],
+    ["real", n(p => offerOf(p) === "real"), "✅ Ofertas reales"],
+    ["deals", n(deal), `Ofertas reales ≥ ${Math.round((1 - DATA.rules.gran_descuento) * 100)} %`],
+    ["discount", n(p => p.discount > 0), "En descuento (según Rappi)"],
+    ["inflado", n(p => offerOf(p) === "inflado"), "🎭 Descuentos inflados"],
     ["changed", n(p => p.prev_price != null && p.price < p.prev_price), "Bajaron en el último cambio"],
     ["alerts", n(p => p.alerts.length), "Con alertas registradas"],
     ["all", n(() => true), "Todo el catálogo"],
@@ -404,6 +415,8 @@ function card(p) {
   const flags = p.flags.map(f => `<span class="badge ${f.rule === "gran_descuento" ? "b-deal" : "b-flag"}">${esc(RULES[f.rule] || f.rule)}</span>`).join("");
   const promo = p.global_offer ? `<span class="badge b-warn">Máx. ${p.global_offer_max} u. · usuario nuevo</span>` : "";
   const disc = p.discount > 0 ? `<span class="badge b-disc">−${pct(p.discount)}</span>` : "";
+  const o = OFFER[offerOf(p)];
+  const kind = o ? `<span class="badge ${o[0]}">${o[1]}</span>` : "";
   const drop = p.prev_price != null && p.price < p.prev_price
     ? `<span class="badge b-muted">antes ${money(p.prev_price)}</span>` : "";
   return `<article class="card prod ${p.in_stock ? "" : "oos"}" data-id="${esc(p.product_id)}">
@@ -413,6 +426,7 @@ function card(p) {
     <div class="meta">${esc(p.trademark || "")}${p.presentation ? " · " + esc(p.presentation) : ""}</div>
     <div class="prices"><span class="price num">${money(p.price)}</span>
       ${p.real_price > p.price ? `<span class="strike num">${money(p.real_price)}</span>` : ""}${disc}</div>
+    ${kind ? `<div>${kind}</div>` : ""}
     <div class="meta">${esc(p.aisle || "")} › ${esc(p.subaisle || "")}</div>
     <div class="meta">${p.in_stock ? `Stock: ${p.stock ?? "sí"}` : "Sin stock"} ${drop}</div>
   </article>`;
@@ -474,6 +488,7 @@ async function openDetail(id) {
       ["Precio actual", money(p.price)],
       ["Precio de lista (tachado)", money(p.real_price)],
       ["Descuento", p.discount > 0 ? `${pct(p.discount)} · ahorrás ${money(p.real_price - p.price)}` : "—"],
+      offerOf(p) && ["¿Es una oferta real?", offerText(p)],
       ["Precio anterior", money(p.prev_price)],
       ["Precio habitual (" + DATA.rules.historial_dias + " días)", money(p.typical_price)],
       ["Mínimo / máximo visto", `${money(p.min_price)} / ${money(p.max_price)}`],
@@ -498,6 +513,13 @@ async function openDetail(id) {
   $("#close").onclick = closeDetail;
   const hist = p.history || await (await fetch(`/api/history?store_id=${DATA.store_id}&product_id=${encodeURIComponent(id)}`)).json();
   $("#chart").innerHTML = chart(hist, p);
+}
+function offerText(p) {
+  const o = p.offer, [, label, why] = OFFER[o.status];
+  const since = `cuesta esto desde el ${when(o.since)}`;
+  if (o.status === "real") return `${label} — antes costaba ${money(o.ref_price)}, ${since}.`;
+  if (o.status === "inflado") return `${label} — ${o.ref_price ? `antes costaba ${money(o.ref_price)}` : since}. ${why}`;
+  return `${label} — ${why}`;
 }
 function closeDetail() { $("#overlay").classList.add("hidden"); }
 $("#overlay").onclick = e => { if (e.target.id === "overlay") closeDetail(); };

@@ -155,12 +155,16 @@ def typical_price(conn, store_id: int, product_id: str, days: int, now: int | No
     """Precio que el producto mantuvo más tiempo en los últimos `days` días,
     sin contar el tramo actual. None si no hay historial previo."""
     now = now or int(time.time())
-    rows = conn.execute(
+    return typical_from_changes(price_rows(conn, store_id, product_id, now), days, now)
+
+
+def price_rows(conn, store_id: int, product_id: str, now: int) -> list:
+    """Cambios de precio del producto hasta `now`, ordenados; el último es el estado actual."""
+    return conn.execute(
         """SELECT ts, price, global_offer, in_stock FROM price_changes
            WHERE store_id=? AND product_id=? AND ts <= ? ORDER BY ts""",
         (store_id, product_id, now),
     ).fetchall()
-    return typical_from_changes(rows, days, now)
 
 
 def typical_from_changes(rows, days: int, now: int) -> float | None:
