@@ -11,12 +11,8 @@ from pathlib import Path
 
 from . import db, detect
 
-UI_RULES = {"precio_absurdo": 10, "caida_vs_historial": 0.5, "descuento_extremo": 0.2,
-            "vs_otras_tiendas": 0.5, "gran_descuento": 0.5, "historial_dias": 14}
-
-
 def rules_of(cfg: dict) -> dict:
-    return {**UI_RULES, **cfg.get("rules", {})}
+    return {**detect.DEFAULT_RULES, **cfg.get("rules", {})}
 
 
 def products_payload(conn, store_id: int, cfg: dict, with_history: bool = False) -> dict:
@@ -49,6 +45,7 @@ def products_payload(conn, store_id: int, cfg: dict, with_history: bool = False)
         p["prev_price"] = hist[-2]["price"] if len(hist) >= 2 else None
         typical = db.typical_from_changes(hist, rules["historial_dias"], now)
         aisle_ref = detect.subaisle_reference(idx, p) if typical is None else None
+        offer = detect.offer_status(hist, rules, now) if hist and not p["global_offer"] else None
         o = sorted(others.get(p["master_product_id"], []))
         median = (o[len(o) // 2] if len(o) % 2 else (o[len(o) // 2 - 1] + o[len(o) // 2]) / 2) if o else None
         p.update(
@@ -56,7 +53,8 @@ def products_payload(conn, store_id: int, cfg: dict, with_history: bool = False)
             min_price=min(prices), max_price=max(prices), n_changes=len(hist),
             last_change=hist[-1]["ts"] if hist else None,
             discount=(1 - p["price"] / p["real_price"]) if p["real_price"] > p["price"] else 0,
-            flags=detect.check(p, typical, median, len(o), rules, include_promos, aisle_ref),
+            flags=detect.check(p, typical, median, len(o), rules, include_promos, aisle_ref, offer),
+            offer=offer,
             alerts=alerts.get(p["product_id"], []),
             url=detect.product_url(p["name"], store_id),
         )
