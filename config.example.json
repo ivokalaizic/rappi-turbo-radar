@@ -1,0 +1,28 @@
+{
+  "locations": [
+    {
+      "name": "Casa",
+      "lat": -34.60372,
+      "lng": -58.38159
+    }
+  ],
+  "request_delay_s": 0.3,
+  "app_version": "web_v1.223.2",
+  "include_new_user_promos": false,
+  "rules": {
+    "precio_absurdo": 10,
+    "caida_vs_historial": 0.5,
+    "descuento_extremo": 0.2,
+    "vs_otras_tiendas": 0.5,
+    "historial_dias": 14,
+    "gran_descuento": 0.5
+  },
+  "notify": {
+    "macos": true,
+    "ui_url": "http://127.0.0.1:8765",
+    "telegram": {
+      "bot_token": "",
+      "chat_id": ""
+    }
+  }
+}

@@ -1,0 +1,93 @@
+# Corrida cada 15 min en GitHub Actions (gratis e ilimitado en repos públicos).
+# Secret CONFIG_JSON: el config.json completo (direcciones + token de Telegram).
+# El estado (data/turbo.db + session.json) vive en el cache de Actions, que no es público.
+name: scrape
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"  # GitHub puede atrasarlo unos minutos
+  workflow_dispatch:
+    inputs:
+      prueba_aviso:
+        description: "Mandar un aviso de prueba por Telegram antes de scrapear"
+        type: boolean
+        default: false
+
+concurrency:
+  group: scrape
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write  # borrar caches viejos y mantener vivo el schedule
+
+env:
+  TZ: America/Argentina/Buenos_Aires
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Config desde el secret
+        env:
+          CONFIG_JSON: ${{ secrets.CONFIG_JSON }}
+        run: |
+          test -n "$CONFIG_JSON" || { echo "Falta el secret CONFIG_JSON"; exit 1; }
+          printf '%s' "$CONFIG_JSON" > config.json
+          # Los logs de un repo público son públicos: ocultar direcciones y coordenadas
+          python3 -c '
+          import json
+          for loc in json.load(open("config.json"))["locations"]:
+              for v in (loc["name"], loc["lat"], loc["lng"]):
+                  print(f"::add-mask::{v}")
+          '
+
+      - name: Aviso de prueba
+        if: inputs.prueba_aviso
+        run: python3 -m turbo notify-test
+
+      - name: Restaurar estado
+        id: state
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            data/turbo.db
+            data/session.json
+          key: turbo-data-${{ github.run_id }}
+          restore-keys: turbo-data-
+
+      - name: Scrapear
+        run: |
+          if [ -f data/turbo.db ]; then
+            python3 -m turbo run
+          else
+            echo "Base nueva: corrida de referencia, sin avisos"
+            python3 -m turbo run --baseline
+          fi
+
+      - name: Guardar estado
+        if: always() && hashFiles('data/turbo.db') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            data/turbo.db
+            data/session.json
+          key: turbo-data-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Limpiar caches viejos y mantener vivo el schedule
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh cache list -R "$GITHUB_REPOSITORY" --key turbo-data- --sort created_at --order desc \
+            --limit 100 --json id -q '.[5:][].id' | xargs -r -n1 gh cache delete -R "$GITHUB_REPOSITORY" || true
+          # GitHub desactiva los cron de repos sin actividad en 60 días; habilitarlo reinicia la cuenta
+          gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/scrape.yml/enable" || true

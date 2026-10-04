@@ -1,0 +1,803 @@
+"""UI web local: python3 ui.py
+
+Pantalla de ingreso (dirección + umbrales) -> corre el scraper para esa tienda
+-> lista de productos en descuento o con precio sospechoso, con todo su detalle.
+Sin dependencias: http.server + sqlite3 + los módulos de turbo/.
+"""
+
+import argparse
+import fcntl
+import json
+import logging
+import re
+import sqlite3
+import threading
+import time
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+from turbo import api, db, detect, notify
+from turbo.__main__ import DATA, DEFAULT_CONFIG, SCHEDULE, resolve_stores, scrape_store
+
+FRESH_S = 15 * 60  # si la última corrida tiene menos de esto, no vuelve a scrapear
+DEFAULT_RULES = {"precio_absurdo": 10, "caida_vs_historial": 0.5, "descuento_extremo": 0.2,
+                 "vs_otras_tiendas": 0.5, "gran_descuento": 0.5, "historial_dias": 14}
+
+log = logging.getLogger("turbo.ui")
+
+
+class State:
+    db_path = DATA / "turbo.db"
+    cfg: dict = {}
+    job: dict = {"phase": "idle"}
+    lock = threading.Lock()
+
+
+def load_cfg() -> dict:
+    try:
+        cfg = json.loads(DEFAULT_CONFIG.read_text())
+    except FileNotFoundError:
+        cfg = {"locations": []}
+    cfg["rules"] = {**DEFAULT_RULES, **cfg.get("rules", {})}
+    return cfg
+
+
+def read_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(f"file:{State.db_path}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def set_job(**kw):
+    with State.lock:
+        State.job.update(kw)
+
+
+# --- Corrida del scraper (en un thread) ------------------------------------
+
+def run_job(loc: dict, force: bool):
+    cfg = {**State.cfg, "locations": [loc]}
+    try:
+        conn = db.connect(State.db_path)
+        client = api.Client(DATA, cfg.get("app_version", "web_v1.223.2"), cfg.get("request_delay_s", 0.3))
+        set_job(phase="resolving", message="Buscando la tienda Turbo que atiende esa dirección…")
+        stores = resolve_stores(conn, client, [loc])
+        if not stores:
+            return set_job(phase="error", message="No hay cobertura de Rappi Turbo en esa dirección.")
+        store_id, s = next(iter(stores.items()))
+        known = conn.execute("SELECT COUNT(*) FROM products WHERE store_id=?", (store_id,)).fetchone()[0]
+        set_job(store_id=store_id, expected=known or 6000)
+
+        last = conn.execute("SELECT finished FROM runs WHERE store_id=? AND status='ok' ORDER BY id DESC LIMIT 1",
+                            (store_id,)).fetchone()
+        if not force and known and last and time.time() - last[0] < FRESH_S:
+            mins = int((time.time() - last[0]) // 60)
+            return set_job(phase="done", skipped=True, message=f"Uso la corrida de hace {mins} min.")
+
+        # Mismo lock que la corrida automática: si está corriendo, la espero y uso su resultado.
+        with open(DATA / "run.lock", "w") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                set_job(phase="waiting", message="Hay una corrida automática en curso, la espero…")
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                return set_job(phase="done", skipped=True, message="Uso el resultado de la corrida automática.")
+
+            started = time.time()
+            set_job(phase="scraping", message="Recorriendo el catálogo…", started=started, count=0)
+
+            def progress(aisle, n):
+                set_job(aisle=aisle, count=n, elapsed=int(time.time() - started))
+
+            findings = scrape_store(conn, client, store_id, s, cfg, progress)
+            # Las está viendo en pantalla: no hace falta avisarlas después
+            notify.mark_notified(conn, [a for a in notify.pending(conn) if a["store_id"] == store_id])
+        status = conn.execute("SELECT status FROM runs WHERE store_id=? ORDER BY id DESC LIMIT 1",
+                              (store_id,)).fetchone()[0]
+        set_job(phase="done", skipped=False, new_alerts=len(findings),
+                message=f"Corrida terminada ({status}) en {int(time.time() - started)} s.")
+    except Exception as e:  # la UI tiene que mostrar el error, no colgarse
+        log.exception("falló la corrida desde la UI")
+        set_job(phase="error", message=f"Error: {e}")
+
+
+def save_location(loc: dict):
+    cfg = json.loads(DEFAULT_CONFIG.read_text()) if DEFAULT_CONFIG.exists() else {"locations": []}
+    cfg["locations"] = [l for l in cfg.get("locations", []) if l["name"] != loc["name"]] + [loc]
+    DEFAULT_CONFIG.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
+
+
+# --- Lectura de resultados --------------------------------------------------
+
+def products_payload(store_id: int) -> dict:
+    cfg, rules = State.cfg, State.cfg["rules"]
+    include_promos = cfg.get("include_new_user_promos", False)
+    now = int(time.time())
+    conn = read_conn()
+
+    changes: dict[str, list] = {}
+    for r in conn.execute("SELECT product_id, ts, price, real_price, global_offer, in_stock FROM price_changes "
+                          "WHERE store_id=? ORDER BY ts", (store_id,)):
+        changes.setdefault(r["product_id"], []).append(r)
+
+    others: dict[int, list[float]] = {}
+    for r in conn.execute("SELECT master_product_id, price FROM products WHERE store_id<>? AND in_stock=1 "
+                          "AND global_offer=0 AND price>0", (store_id,)):
+        others.setdefault(r["master_product_id"], []).append(r["price"])
+
+    alerts: dict[str, list] = {}
+    for r in conn.execute("SELECT product_id, ts, rule, price, ref_price, ratio, detail FROM alerts "
+                          "WHERE store_id=? ORDER BY ts DESC", (store_id,)):
+        alerts.setdefault(r["product_id"], []).append({k: r[k] for k in r.keys() if k != "product_id"})
+
+    items = []
+    for row in conn.execute("SELECT * FROM products WHERE store_id=?", (store_id,)):
+        p = dict(row)
+        hist = changes.get(p["product_id"], [])
+        clean = [h for h in hist if not h["global_offer"]]
+        prices = [h["price"] for h in clean] or [p["price"]]
+        p["prev_price"] = hist[-2]["price"] if len(hist) >= 2 else None
+        typical = db.typical_from_changes(clean, rules["historial_dias"], now)
+        o = sorted(others.get(p["master_product_id"], []))
+        median = (o[len(o) // 2] if len(o) % 2 else (o[len(o) // 2 - 1] + o[len(o) // 2]) / 2) if o else None
+        p.update(
+            typical_price=typical, other_median=median, other_stores=len(o),
+            min_price=min(prices), max_price=max(prices), n_changes=len(hist),
+            last_change=hist[-1]["ts"] if hist else None,
+            discount=(1 - p["price"] / p["real_price"]) if p["real_price"] > p["price"] else 0,
+            flags=detect.check(p, typical, median, len(o), rules, include_promos),
+            alerts=alerts.get(p["product_id"], []),
+            url=detect.product_url(p["name"], store_id),
+        )
+        items.append(p)
+
+    run = conn.execute("SELECT * FROM runs WHERE store_id=? ORDER BY id DESC LIMIT 1", (store_id,)).fetchone()
+    loc_rows = conn.execute("SELECT name, covered FROM locations WHERE store_id=?", (store_id,)).fetchall()
+    locs = [r["name"] for r in loc_rows]
+    conn.close()
+    return {"store_id": store_id, "locations": locs, "run": dict(run) if run else None,
+            "covered": any(r["covered"] for r in loc_rows) if loc_rows else True,
+            "rules": rules, "include_new_user_promos": include_promos, "products": items}
+
+
+def history_payload(store_id: int, product_id: str) -> list[dict]:
+    conn = read_conn()
+    rows = conn.execute("SELECT ts, price, real_price, global_offer, in_stock FROM price_changes "
+                        "WHERE store_id=? AND product_id=? ORDER BY ts", (store_id, product_id)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def parse_coords(text: str) -> tuple[float, float] | None:
+    nums = re.findall(r"-?\d+(?:\.\d+)?", text or "")
+    if len(nums) != 2:
+        return None
+    lat, lng = float(nums[0]), float(nums[1])
+    return (lat, lng) if -90 <= lat <= 90 and -180 <= lng <= 180 else None
+
+
+# --- HTTP -------------------------------------------------------------------
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def send(self, code, body, ctype="application/json; charset=utf-8"):
+        data = body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        url = urlparse(self.path)
+        q = {k: v[0] for k, v in parse_qs(url.query).items()}
+        try:
+            if url.path == "/":
+                return self.send(200, PAGE.encode(), "text/html; charset=utf-8")
+            if url.path == "/api/init":
+                conn = read_conn()
+                saved = {r["name"]: r["store_id"] for r in conn.execute("SELECT name, store_id FROM locations")}
+                conn.close()
+                return self.send(200, {
+                    "locations": [{**l, "store_id": saved.get(l["name"])} for l in State.cfg.get("locations", [])],
+                    "rules": State.cfg["rules"],
+                    "include_new_user_promos": State.cfg.get("include_new_user_promos", False),
+                    "job": State.job,
+                })
+            if url.path == "/api/schedule":
+                try:
+                    return self.send(200, json.loads(SCHEDULE.read_text()))
+                except (FileNotFoundError, json.JSONDecodeError):
+                    return self.send(200, {})
+            if url.path == "/api/job":
+                with State.lock:
+                    return self.send(200, dict(State.job))
+            if url.path == "/api/products":
+                return self.send(200, products_payload(int(q["store_id"])))
+            if url.path == "/api/history":
+                return self.send(200, history_payload(int(q["store_id"]), q["product_id"]))
+            self.send(404, {"error": "not found"})
+        except Exception as e:
+            log.exception("GET %s", self.path)
+            self.send(500, {"error": str(e)})
+
+    def do_POST(self):
+        if urlparse(self.path).path != "/api/start":
+            return self.send(404, {"error": "not found"})
+        body = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
+        coords = parse_coords(body.get("coords", ""))
+        if not coords:
+            return self.send(400, {"error": "Coordenadas inválidas. Pegá algo como: -34.60372, -58.38159"})
+        if State.job.get("phase") in ("resolving", "scraping", "waiting"):
+            return self.send(409, {"error": "Ya hay una búsqueda en curso."})
+        loc = {"name": (body.get("name") or "").strip() or f"{coords[0]:.5f}, {coords[1]:.5f}",
+               "lat": coords[0], "lng": coords[1]}
+        rules = {k: float(body.get("rules", {}).get(k, v)) for k, v in DEFAULT_RULES.items()}
+        rules["historial_dias"] = int(rules["historial_dias"])
+        State.cfg = {**load_cfg(), "rules": rules,
+                     "include_new_user_promos": bool(body.get("include_new_user_promos"))}
+        if body.get("save"):
+            save_location(loc)
+        with State.lock:
+            State.job = {"phase": "resolving", "message": "Arrancando…", "location": loc["name"]}
+        threading.Thread(target=run_job, args=(loc, bool(body.get("force"))), daemon=True).start()
+        self.send(200, {"ok": True})
+
+
+def main():
+    ap = argparse.ArgumentParser(description="UI web local del detector de Rappi Turbo")
+    ap.add_argument("--port", type=int, default=8765)
+    ap.add_argument("--db", type=Path, help="otra base (p. ej. una copia para pruebas)")
+    ap.add_argument("--no-browser", action="store_true")
+    args = ap.parse_args()
+
+    DATA.mkdir(exist_ok=True)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s",
+                        handlers=[logging.StreamHandler(), logging.FileHandler(DATA / "turbo.log")])
+    if args.db:
+        State.db_path = args.db
+    db.connect(State.db_path).close()  # crea el esquema si es la primera vez
+    State.cfg = load_cfg()
+
+    server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    url = f"http://127.0.0.1:{args.port}/"
+    print(f"Rappi Turbo UI en {url}  (Ctrl+C para cortar)")
+    if not args.no_browser:
+        threading.Timer(0.5, webbrowser.open, (url,)).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+PAGE = r"""<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Turbo Radar</title>
+<style>
+:root {
+  --bg: #f6f5f2; --surface: #ffffff; --surface-2: #f0eee9; --border: #e3e0d8;
+  --text: #1d1b18; --muted: #6f6a60; --accent: #ff441f; --accent-ink: #ffffff;
+  --good: #1f8a4c; --good-bg: #e3f4ea; --warn: #b35c00; --warn-bg: #fdf0dc;
+  --bad: #c62828; --bad-bg: #fde6e4; --shadow: 0 1px 2px rgba(0,0,0,.05), 0 8px 24px rgba(0,0,0,.06);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #141311; --surface: #1d1c19; --surface-2: #262420; --border: #34312b;
+    --text: #f1eee8; --muted: #a39d92; --accent: #ff5a3a; --accent-ink: #ffffff;
+    --good: #5fd08e; --good-bg: #183324; --warn: #f0a24a; --warn-bg: #3a2a14;
+    --bad: #ff7b6e; --bad-bg: #3d1c19; --shadow: 0 1px 2px rgba(0,0,0,.4);
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+button, input, select { font: inherit; color: inherit; }
+.hidden { display: none !important; }
+.muted { color: var(--muted); }
+.num { font-variant-numeric: tabular-nums; }
+
+/* Ingreso */
+.login { min-height: 100vh; display: grid; place-items: center; padding: 24px 16px; }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; box-shadow: var(--shadow); }
+.login .card { width: 100%; max-width: 440px; padding: 28px; }
+.brand { display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
+.logo { width: 34px; height: 34px; border-radius: 10px; background: var(--accent); color: var(--accent-ink);
+  display: grid; place-items: center; font-weight: 800; }
+h1 { font-size: 22px; margin: 0; }
+.sub { color: var(--muted); margin: 0 0 22px; }
+label { display: block; font-weight: 600; font-size: 13px; margin: 14px 0 6px; }
+.hint { font-weight: 400; color: var(--muted); font-size: 12px; }
+input[type=text], input[type=number], select {
+  width: 100%; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--surface); }
+input:focus, select:focus { outline: 2px solid color-mix(in srgb, var(--accent) 45%, transparent); border-color: var(--accent); }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.chip { border: 1px solid var(--border); background: var(--surface-2); border-radius: 999px; padding: 4px 10px;
+  font-size: 12px; cursor: pointer; }
+.chip:hover { border-color: var(--accent); }
+details { margin-top: 16px; border-top: 1px solid var(--border); padding-top: 12px; }
+summary { cursor: pointer; font-weight: 600; font-size: 13px; }
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 12px; }
+.check { display: flex; gap: 8px; align-items: flex-start; font-weight: 400; margin-top: 12px; }
+.check input { margin-top: 3px; }
+.btn { width: 100%; margin-top: 20px; padding: 12px; border: 0; border-radius: 10px; background: var(--accent);
+  color: var(--accent-ink); font-weight: 700; cursor: pointer; }
+.btn:disabled { opacity: .6; cursor: wait; }
+.btn.ghost { background: transparent; color: var(--text); border: 1px solid var(--border); width: auto; margin: 0; padding: 8px 12px; font-weight: 600; }
+.error { color: var(--bad); font-size: 13px; margin-top: 10px; }
+
+/* Progreso */
+.progress { min-height: 100vh; display: grid; place-items: center; padding: 16px; }
+.progress .card { width: 100%; max-width: 440px; padding: 28px; text-align: center; }
+.bar { height: 8px; background: var(--surface-2); border-radius: 999px; overflow: hidden; margin: 18px 0 10px; }
+.bar > div { height: 100%; width: 0; background: var(--accent); transition: width .4s; }
+.bar.indet > div { width: 30%; animation: indet 1.2s infinite ease-in-out; }
+@keyframes indet { from { margin-left: -30%; } to { margin-left: 100%; } }
+
+/* Resultados */
+header.top { position: sticky; top: 0; z-index: 5; background: color-mix(in srgb, var(--bg) 92%, transparent);
+  backdrop-filter: blur(8px); border-bottom: 1px solid var(--border); }
+.wrap { max-width: 1280px; margin: 0 auto; padding: 0 16px; }
+.topbar { display: flex; align-items: center; gap: 12px; padding: 12px 0; flex-wrap: wrap; }
+.topbar .info { flex: 1; min-width: 200px; }
+.topbar .info b { font-size: 16px; }
+.kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 16px 0; }
+.kpi { padding: 12px 14px; cursor: pointer; }
+.kpi.active { border-color: var(--accent); }
+.kpi .v { font-size: 22px; font-weight: 700; }
+.kpi .l { color: var(--muted); font-size: 12px; }
+.filters { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; padding-bottom: 12px; }
+.filters > * { width: auto; }
+.filters input[type=text] { flex: 1; min-width: 200px; }
+.filters .check { margin: 0; }
+.list { display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 12px; padding-bottom: 40px; }
+.prod { padding: 12px; cursor: pointer; display: flex; flex-direction: column; gap: 6px; position: relative; }
+.prod:hover { border-color: var(--accent); }
+.prod.oos { opacity: .55; }
+.prod .img { aspect-ratio: 1; background: #fff; border-radius: 10px; display: grid; place-items: center; overflow: hidden; }
+.prod .img img { width: 82%; height: 82%; object-fit: contain; }
+.prod .name { font-weight: 600; line-height: 1.3; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.prod .meta { color: var(--muted); font-size: 12px; }
+.prices { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.price { font-size: 18px; font-weight: 700; }
+.strike { color: var(--muted); text-decoration: line-through; font-size: 13px; }
+.badge { display: inline-block; font-size: 11px; font-weight: 700; padding: 2px 7px; border-radius: 6px; }
+.b-disc { background: var(--good-bg); color: var(--good); }
+.b-flag { background: var(--bad-bg); color: var(--bad); }
+.b-deal { background: var(--accent); color: var(--accent-ink); }
+.b-warn { background: var(--warn-bg); color: var(--warn); }
+.b-muted { background: var(--surface-2); color: var(--muted); }
+.prod .corner { position: absolute; top: 18px; left: 18px; display: flex; flex-direction: column; gap: 4px; align-items: flex-start; }
+.empty { text-align: center; padding: 60px 16px; color: var(--muted); }
+.more { display: block; margin: 0 auto 40px; }
+
+/* Detalle */
+.overlay { position: fixed; inset: 0; background: rgba(0,0,0,.45); z-index: 20; display: flex; justify-content: flex-end; }
+.drawer { width: min(560px, 100%); height: 100%; overflow-y: auto; background: var(--surface); padding: 20px; }
+.drawer .head { display: flex; gap: 14px; align-items: flex-start; }
+.drawer .head img { width: 110px; height: 110px; object-fit: contain; background: #fff; border-radius: 12px; border: 1px solid var(--border); flex: none; }
+.drawer h2 { font-size: 18px; margin: 0 0 4px; }
+.close { margin-left: auto; flex: none; }
+.section { margin-top: 18px; }
+.section h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 0 0 8px; }
+table.kv { width: 100%; border-collapse: collapse; }
+table.kv td { padding: 6px 0; border-bottom: 1px solid var(--border); vertical-align: top; }
+table.kv td:first-child { color: var(--muted); width: 45%; padding-right: 10px; }
+.flag-row { padding: 10px 12px; border-radius: 10px; background: var(--bad-bg); color: var(--bad); margin-bottom: 6px; }
+.chart { width: 100%; height: 180px; }
+.chart text { fill: var(--muted); font-size: 10px; }
+a { color: var(--accent); }
+.link-btn { display: inline-block; margin-top: 14px; padding: 10px 14px; border-radius: 10px; background: var(--accent); color: var(--accent-ink); text-decoration: none; font-weight: 700; }
+@media (max-width: 520px) {
+  .grid2 { grid-template-columns: 1fr; }
+  .list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .prod .price { font-size: 16px; }
+}
+</style>
+</head>
+<body>
+
+<!-- 1. Ingreso -->
+<section id="v-login" class="login">
+  <form class="card" id="form">
+    <div class="brand"><div class="logo">T</div><h1>Turbo Radar</h1></div>
+    <p class="sub">Precios mal cargados y descuentos en Rappi Turbo</p>
+
+    <label for="name">Nombre de la dirección <span class="hint">(opcional)</span></label>
+    <input type="text" id="name" placeholder="Casa, oficina…" autocomplete="off">
+
+    <label for="coords">Coordenadas <span class="hint">— Google Maps → clic derecho → copiar</span></label>
+    <input type="text" id="coords" placeholder="-34.60372, -58.38159" required autocomplete="off">
+    <div class="chips" id="saved"></div>
+
+    <details>
+      <summary>Umbrales de detección</summary>
+      <div class="grid2">
+        <div><label for="r_abs">Precio absurdo ≤ $</label><input type="number" id="r_abs" step="1" min="0"></div>
+        <div><label for="r_disc">Descuento extremo ≥ %</label><input type="number" id="r_disc" step="1" min="0" max="100"></div>
+        <div><label for="r_hist">Caída vs. habitual ≥ %</label><input type="number" id="r_hist" step="1" min="0" max="100"></div>
+        <div><label for="r_other">Vs. otras tiendas ≥ %</label><input type="number" id="r_other" step="1" min="0" max="100"></div>
+        <div><label for="r_deal">Oferta fuerte ≥ %</label><input type="number" id="r_deal" step="1" min="0" max="100"></div>
+        <div><label for="r_days">Historial (días)</label><input type="number" id="r_days" step="1" min="1"></div>
+      </div>
+      <label class="check"><input type="checkbox" id="promos"> Incluir promos de usuario nuevo («Máx. 1 Ud.»; no aplican a cuentas existentes)</label>
+    </details>
+
+    <label class="check"><input type="checkbox" id="force"> Scrapear de nuevo aunque haya datos de menos de 15 min</label>
+    <label class="check"><input type="checkbox" id="save"> Guardar la dirección para el monitoreo cada 15 min</label>
+
+    <button class="btn" id="go" type="submit">Buscar ofertas</button>
+    <div class="error hidden" id="err"></div>
+  </form>
+</section>
+
+<!-- 2. Progreso -->
+<section id="v-progress" class="progress hidden">
+  <div class="card">
+    <div class="brand" style="justify-content:center"><div class="logo">T</div><h1>Recorriendo la tienda</h1></div>
+    <div class="bar indet" id="bar"><div></div></div>
+    <div id="p-msg"></div>
+    <div class="muted num" id="p-detail" style="margin-top:6px"></div>
+  </div>
+</section>
+
+<!-- 3. Resultados -->
+<section id="v-results" class="hidden">
+  <header class="top">
+    <div class="wrap">
+      <div class="topbar">
+        <div class="logo">T</div>
+        <div class="info"><b id="r-title"></b><div class="muted"><span id="r-sub"></span> · <span id="r-next" class="num">…</span></div></div>
+        <button class="btn ghost" id="refresh" type="button">Actualizar</button>
+        <button class="btn ghost" id="back" type="button">Cambiar dirección</button>
+      </div>
+      <div class="filters">
+        <input type="text" id="q" placeholder="Buscar producto, marca o pasillo…">
+        <select id="aisle"><option value="">Todos los pasillos</option></select>
+        <select id="sort">
+          <option value="flag">Más sospechosos primero</option>
+          <option value="disc">Mayor descuento</option>
+          <option value="save">Mayor ahorro en $</option>
+          <option value="price">Menor precio</option>
+          <option value="recent">Cambio más reciente</option>
+          <option value="alert">Alerta más reciente</option>
+        </select>
+        <select id="mindisc">
+          <option value="0">Cualquier descuento</option>
+          <option value="0.2">≥ 20 %</option>
+          <option value="0.3">≥ 30 %</option>
+          <option value="0.5">≥ 50 %</option>
+          <option value="0.7">≥ 70 %</option>
+        </select>
+        <label class="check"><input type="checkbox" id="stock" checked> Solo con stock</label>
+        <label class="check"><input type="checkbox" id="showpromos"> Promos usuario nuevo</label>
+      </div>
+    </div>
+  </header>
+  <main class="wrap">
+    <div class="kpis" id="kpis"></div>
+    <div class="list" id="list"></div>
+    <div class="empty hidden" id="empty"></div>
+    <button class="btn ghost more hidden" id="more" type="button">Ver más</button>
+  </main>
+</section>
+
+<div class="overlay hidden" id="overlay"><aside class="drawer" id="drawer"></aside></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const money = v => v == null ? "—" : "$ " + Number(v).toLocaleString("es-AR", {minimumFractionDigits: v % 1 ? 2 : 0, maximumFractionDigits: 2});
+const pct = v => v == null ? "—" : Math.floor(v * 100) + " %";
+// El CDN sirve el PNG original como octet-stream; redimensionado sale como imagen y pesa menos.
+const img = (u, px) => u ? `${u}?d=${px}x${px}&e=webp` : "";
+const when = ts => ts ? new Date(ts * 1000).toLocaleString("es-AR", {day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit"}) : "—";
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+const RULES = {
+  precio_absurdo: "Precio absurdo", caida_vs_historial: "Bajó vs. su precio habitual",
+  descuento_extremo: "Descuento extremo", vs_otras_tiendas: "Más barato que en otras tiendas",
+  promo_usuario_nuevo: "Promo usuario nuevo", gran_descuento: "Oferta fuerte",
+};
+const weird = p => p.flags.some(f => f.rule !== "gran_descuento");
+const deal = p => p.flags.some(f => f.rule === "gran_descuento");
+let DATA = null, VIEW = "flagged", PAGE = 120, SHOWN = PAGE;
+
+function show(id) {
+  for (const v of ["v-login", "v-progress", "v-results"]) $("#" + v).classList.toggle("hidden", v !== id);
+  window.scrollTo(0, 0);
+}
+
+// ---------- Ingreso ----------
+async function init() {
+  const d = await (await fetch("/api/init")).json();
+  const r = d.rules;
+  $("#r_abs").value = r.precio_absurdo;
+  $("#r_disc").value = Math.round((1 - r.descuento_extremo) * 100);
+  $("#r_hist").value = Math.round((1 - r.caida_vs_historial) * 100);
+  $("#r_other").value = Math.round((1 - r.vs_otras_tiendas) * 100);
+  $("#r_deal").value = Math.round((1 - r.gran_descuento) * 100);
+  $("#r_days").value = r.historial_dias;
+  $("#promos").checked = d.include_new_user_promos;
+  $("#saved").innerHTML = d.locations.map((l, i) =>
+    `<button type="button" class="chip" data-i="${i}">${esc(l.name)}</button>`).join("");
+  $("#saved").onclick = e => {
+    const l = d.locations[e.target.dataset.i];
+    if (!l) return;
+    $("#name").value = l.name; $("#coords").value = `${l.lat}, ${l.lng}`;
+  };
+  if (d.locations.length && !$("#coords").value) {
+    $("#name").value = d.locations[0].name; $("#coords").value = `${d.locations[0].lat}, ${d.locations[0].lng}`;
+  }
+  const qs = new URLSearchParams(location.search);
+  if (qs.get("store")) return loadResults(Number(qs.get("store")), "", qs.get("view"));
+  if (["resolving", "scraping", "waiting"].includes(d.job.phase)) { show("v-progress"); poll(); }
+}
+
+$("#form").onsubmit = async e => {
+  e.preventDefault();
+  $("#err").classList.add("hidden");
+  $("#go").disabled = true;
+  const off = id => 1 - Number($(id).value) / 100;
+  const body = {
+    name: $("#name").value, coords: $("#coords").value,
+    force: $("#force").checked, save: $("#save").checked,
+    include_new_user_promos: $("#promos").checked,
+    rules: {precio_absurdo: Number($("#r_abs").value), descuento_extremo: off("#r_disc"),
+            caida_vs_historial: off("#r_hist"), vs_otras_tiendas: off("#r_other"), gran_descuento: off("#r_deal"),
+            historial_dias: Number($("#r_days").value)},
+  };
+  const res = await fetch("/api/start", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+  $("#go").disabled = false;
+  if (!res.ok) {
+    $("#err").textContent = (await res.json()).error;
+    $("#err").classList.remove("hidden");
+    return;
+  }
+  $("#showpromos").checked = body.include_new_user_promos;
+  show("v-progress"); poll();
+};
+
+// ---------- Progreso ----------
+async function poll() {
+  const j = await (await fetch("/api/job")).json();
+  $("#p-msg").textContent = j.message || "";
+  const bar = $("#bar");
+  if (j.phase === "scraping") {
+    const frac = Math.min(0.99, (j.count || 0) / (j.expected || 6000));
+    bar.classList.remove("indet"); bar.firstElementChild.style.width = (frac * 100) + "%";
+    const eta = j.count && j.elapsed ? Math.max(0, Math.round(j.elapsed / frac - j.elapsed)) : null;
+    $("#p-detail").textContent = `${(j.count || 0).toLocaleString("es-AR")} productos · ${j.aisle || "…"} · ${j.elapsed || 0} s` +
+      (eta != null ? ` · faltan ~${eta} s` : "");
+  } else {
+    bar.classList.add("indet"); bar.firstElementChild.style.width = "";
+    $("#p-detail").textContent = j.location || "";
+  }
+  if (j.phase === "done") return loadResults(j.store_id, j.message);
+  if (j.phase === "error") {
+    show("v-login");
+    $("#err").textContent = j.message; $("#err").classList.remove("hidden");
+    return;
+  }
+  setTimeout(poll, 800);
+}
+
+// ---------- Resultados ----------
+async function loadResults(storeId, note, view) {
+  $("#p-msg").textContent = "Analizando precios…";
+  DATA = await (await fetch("/api/products?store_id=" + storeId)).json();
+  DATA.note = note;
+  const aisles = [...new Set(DATA.products.map(p => p.aisle).filter(Boolean))].sort();
+  $("#aisle").innerHTML = `<option value="">Todos los pasillos</option>` + aisles.map(a => `<option>${esc(a)}</option>`).join("");
+  const flagged = DATA.products.filter(p => weird(p) && p.in_stock).length;
+  VIEW = view || (flagged ? "flagged" : DATA.products.some(deal) ? "deals" : "discount");
+  if (VIEW === "alerts") $("#sort").value = "alert";
+  if ($("#v-results").classList.contains("hidden")) show("v-results");
+  render();
+}
+
+function base() {
+  const showPromos = $("#showpromos").checked;
+  return DATA.products.filter(p => showPromos || !p.global_offer);
+}
+
+function filtered() {
+  const q = $("#q").value.trim().toLowerCase(), aisle = $("#aisle").value, min = Number($("#mindisc").value);
+  const stock = $("#stock").checked;
+  let list = base().filter(p => {
+    if (VIEW === "flagged" && !weird(p)) return false;
+    if (VIEW === "deals" && !deal(p)) return false;
+    if (VIEW === "discount" && !(p.discount > 0)) return false;
+    if (VIEW === "alerts" && !p.alerts.length) return false;
+    if (VIEW === "changed" && !(p.prev_price != null && p.price < p.prev_price)) return false;
+    if (stock && !p.in_stock) return false;
+    if (aisle && p.aisle !== aisle) return false;
+    if (min && p.discount < min) return false;
+    if (q && !`${p.name} ${p.trademark} ${p.aisle} ${p.subaisle}`.toLowerCase().includes(q)) return false;
+    return true;
+  });
+  const minRatio = p => Math.min(1, ...p.flags.map(f => f.ratio ?? 0));
+  const sorters = {
+    flag: (a, b) => (b.flags.length - a.flags.length) || (minRatio(a) - minRatio(b)) || (b.discount - a.discount),
+    disc: (a, b) => b.discount - a.discount,
+    save: (a, b) => (b.real_price - b.price) - (a.real_price - a.price),
+    price: (a, b) => a.price - b.price,
+    recent: (a, b) => (b.last_change || 0) - (a.last_change || 0),
+    alert: (a, b) => ((b.alerts[0] || {}).ts || 0) - ((a.alerts[0] || {}).ts || 0),
+  };
+  return list.sort(sorters[$("#sort").value]);
+}
+
+function render() {
+  const all = base(), r = DATA.run;
+  $("#r-title").textContent = DATA.locations.join(" · ") || "Tienda " + DATA.store_id;
+  $("#r-sub").textContent = `Tienda Turbo ${DATA.store_id} · última corrida ${when(r && r.finished)}` +
+    (r ? ` · ${r.products.toLocaleString("es-AR")} productos · ${r.status}` : "") + (DATA.note ? ` · ${DATA.note}` : "") +
+    (DATA.covered ? "" : " · ⚠ esta tienda no entrega ahora en tu dirección");
+  const stock = $("#stock").checked;
+  const n = f => all.filter(p => f(p) && (!stock || p.in_stock)).length;
+  const kpis = [
+    ["flagged", n(weird), "Precio sospechoso"],
+    ["deals", n(deal), `Ofertas fuertes (≥ ${Math.round((1 - DATA.rules.gran_descuento) * 100)} %)`],
+    ["discount", n(p => p.discount > 0), "En descuento"],
+    ["changed", n(p => p.prev_price != null && p.price < p.prev_price), "Bajaron en el último cambio"],
+    ["alerts", n(p => p.alerts.length), "Con alertas registradas"],
+    ["all", n(() => true), "Todo el catálogo"],
+  ];
+  $("#kpis").innerHTML = kpis.map(([k, v, l]) =>
+    `<div class="card kpi ${VIEW === k ? "active" : ""}" data-k="${k}"><div class="v num">${v.toLocaleString("es-AR")}</div><div class="l">${l}</div></div>`).join("");
+
+  const list = filtered();
+  $("#list").innerHTML = list.slice(0, SHOWN).map((p, i) => card(p)).join("");
+  $("#more").classList.toggle("hidden", list.length <= SHOWN);
+  $("#more").textContent = `Ver más (${(list.length - SHOWN).toLocaleString("es-AR")} restantes)`;
+  const empty = $("#empty");
+  empty.classList.toggle("hidden", list.length > 0);
+  if (!list.length) empty.innerHTML = VIEW === "flagged"
+    ? `<b>Ningún precio sospechoso con estos umbrales.</b><br>Es lo normal: los errores de carga son raros. Mirá «En descuento» para ver las ofertas actuales.`
+    : "No hay productos con estos filtros.";
+}
+
+function card(p) {
+  const flags = p.flags.map(f => `<span class="badge ${f.rule === "gran_descuento" ? "b-deal" : "b-flag"}">${esc(RULES[f.rule] || f.rule)}</span>`).join("");
+  const promo = p.global_offer ? `<span class="badge b-warn">Máx. ${p.global_offer_max} u. · usuario nuevo</span>` : "";
+  const disc = p.discount > 0 ? `<span class="badge b-disc">−${pct(p.discount)}</span>` : "";
+  const drop = p.prev_price != null && p.price < p.prev_price
+    ? `<span class="badge b-muted">antes ${money(p.prev_price)}</span>` : "";
+  return `<article class="card prod ${p.in_stock ? "" : "oos"}" data-id="${esc(p.product_id)}">
+    <div class="img">${p.image_url ? `<img loading="lazy" src="${esc(img(p.image_url, 240))}" alt="">` : ""}</div>
+    <div class="corner">${flags}${promo}</div>
+    <div class="name">${esc(p.name)}</div>
+    <div class="meta">${esc(p.trademark || "")}${p.presentation ? " · " + esc(p.presentation) : ""}</div>
+    <div class="prices"><span class="price num">${money(p.price)}</span>
+      ${p.real_price > p.price ? `<span class="strike num">${money(p.real_price)}</span>` : ""}${disc}</div>
+    <div class="meta">${esc(p.aisle || "")} › ${esc(p.subaisle || "")}</div>
+    <div class="meta">${p.in_stock ? `Stock: ${p.stock ?? "sí"}` : "Sin stock"} ${drop}</div>
+  </article>`;
+}
+
+$("#kpis").onclick = e => { const k = e.target.closest(".kpi"); if (k) { VIEW = k.dataset.k; SHOWN = PAGE; render(); } };
+for (const id of ["#q", "#aisle", "#sort", "#mindisc", "#stock", "#showpromos"])
+  $(id).addEventListener("input", () => { SHOWN = PAGE; render(); });
+$("#more").onclick = () => { SHOWN += PAGE; render(); };
+$("#back").onclick = () => show("v-login");
+$("#refresh").onclick = () => loadResults(DATA.store_id, "");
+$("#list").onclick = e => { const c = e.target.closest(".prod"); if (c) openDetail(c.dataset.id); };
+
+// ---------- Próxima corrida (launchd) ----------
+let SCHED = {}, NEXT_RELOAD = 0;
+async function fetchSchedule() {
+  try { SCHED = await (await fetch("/api/schedule")).json(); } catch { SCHED = {}; }
+  // Terminó una corrida más nueva que lo que estoy mostrando: recargo solo
+  if (DATA && SCHED.last_end && DATA.run && SCHED.last_end > DATA.run.finished + 5 && !$("#v-results").classList.contains("hidden")
+      && $("#overlay").classList.contains("hidden") && Date.now() > NEXT_RELOAD) {
+    NEXT_RELOAD = Date.now() + 60000;
+    loadResults(DATA.store_id, "actualizado solo", VIEW);
+  }
+}
+function tick() {
+  const el = $("#r-next");
+  if (!SCHED.interval) { el.textContent = "monitoreo automático no instalado"; return; }
+  if (SCHED.running) { el.textContent = "corriendo ahora…"; return; }
+  const left = Math.round(SCHED.last_start + SCHED.interval - Date.now() / 1000);
+  if (left <= 0) { el.textContent = "próxima corrida en cualquier momento"; return; }
+  const m = Math.floor(left / 60), s = String(left % 60).padStart(2, "0");
+  el.textContent = `próxima corrida en ${m}:${s}`;
+}
+setInterval(tick, 1000);
+setInterval(fetchSchedule, 10000);
+fetchSchedule().then(tick);
+
+// ---------- Detalle ----------
+async function openDetail(id) {
+  const p = DATA.products.find(x => x.product_id === id);
+  const rows = (pairs) => pairs.filter(Boolean).map(([k, v]) => `<tr><td>${k}</td><td class="num">${v}</td></tr>`).join("");
+  const flags = p.flags.map(f => `<div class="flag-row"><b>${esc(RULES[f.rule] || f.rule)}</b> — ${money(p.price)} vs ${money(f.ref_price)}` +
+    (f.ratio != null ? ` (${pct(1 - f.ratio)} menos)` : "") + (f.detail ? ` · ${esc(f.detail)}` : "") + `</div>`).join("");
+  const alerts = p.alerts.map(a => `<tr><td>${when(a.ts)}</td><td>${esc(RULES[a.rule] || a.rule)}: ${money(a.price)} vs ${money(a.ref_price)}</td></tr>`).join("");
+  $("#drawer").innerHTML = `
+    <div class="head">
+      ${p.image_url ? `<img src="${esc(img(p.image_url, 300))}" alt="">` : ""}
+      <div><h2>${esc(p.name)}</h2>
+        <div class="muted">${esc(p.trademark || "")}${p.presentation ? " · " + esc(p.presentation) : ""}</div>
+        <div class="prices" style="margin-top:8px"><span class="price num">${money(p.price)}</span>
+          ${p.real_price > p.price ? `<span class="strike num">${money(p.real_price)}</span><span class="badge b-disc">−${pct(p.discount)}</span>` : ""}</div>
+      </div>
+      <button class="btn ghost close" id="close" type="button" aria-label="Cerrar">✕</button>
+    </div>
+    <a class="link-btn" href="${esc(p.url)}" target="_blank" rel="noopener">Abrir en Rappi ↗</a>
+    ${flags ? `<div class="section"><h3>Por qué aparece</h3>${flags}</div>` : ""}
+    <div class="section"><h3>Historial de precio</h3><div id="chart" class="muted">Cargando…</div></div>
+    <div class="section"><h3>Precio</h3><table class="kv">${rows([
+      ["Precio actual", money(p.price)],
+      ["Precio de lista (tachado)", money(p.real_price)],
+      ["Descuento", p.discount > 0 ? `${pct(p.discount)} · ahorrás ${money(p.real_price - p.price)}` : "—"],
+      ["Precio anterior", money(p.prev_price)],
+      ["Precio habitual (" + DATA.rules.historial_dias + " días)", money(p.typical_price)],
+      ["Mínimo / máximo visto", `${money(p.min_price)} / ${money(p.max_price)}`],
+      ["Mediana en otras tiendas", p.other_stores ? `${money(p.other_median)} (${p.other_stores} tiendas)` : "Sin datos de otras tiendas"],
+      ["Cambios registrados", p.n_changes],
+      ["Último cambio", when(p.last_change)],
+      ["Promo usuario nuevo", p.global_offer ? `Sí — máx. ${p.global_offer_max} u. (no aplica a cuentas existentes)` : (p.global_offer_max ? `No (oferta con tope ${p.global_offer_max} u.)` : "No")],
+    ])}</table></div>
+    <div class="section"><h3>Producto</h3><table class="kv">${rows([
+      ["Stock", p.in_stock ? (p.stock ?? "Disponible") : "Sin stock"],
+      ["Pasillo", `${esc(p.aisle || "—")} › ${esc(p.subaisle || "—")}`],
+      ["Marca", esc(p.trademark || "—")],
+      ["Presentación", esc(p.presentation || "—")],
+      ["Tienda", DATA.store_id],
+      ["product_id", esc(p.product_id)],
+      ["master_product_id", esc(p.master_product_id)],
+      ["Visto por primera vez", when(p.first_seen)],
+      ["Visto por última vez", when(p.last_seen)],
+    ])}</table></div>
+    ${alerts ? `<div class="section"><h3>Alertas registradas</h3><table class="kv">${alerts}</table></div>` : ""}`;
+  $("#overlay").classList.remove("hidden");
+  $("#close").onclick = closeDetail;
+  const hist = await (await fetch(`/api/history?store_id=${DATA.store_id}&product_id=${encodeURIComponent(id)}`)).json();
+  $("#chart").innerHTML = chart(hist, p);
+}
+function closeDetail() { $("#overlay").classList.add("hidden"); }
+$("#overlay").onclick = e => { if (e.target.id === "overlay") closeDetail(); };
+document.addEventListener("keydown", e => { if (e.key === "Escape") closeDetail(); });
+
+function chart(hist, p) {
+  if (!hist.length) return "Sin historial todavía.";
+  const now = Date.now() / 1000;
+  const pts = hist.map(h => ({t: h.ts, v: h.price, r: h.real_price, promo: h.global_offer}));
+  const t0 = pts[0].t, t1 = Math.max(now, t0 + 3600);
+  const vmax = Math.max(...pts.map(x => Math.max(x.v, x.r))) * 1.08, vmin = 0;
+  const W = 520, H = 180, L = 56, R = 10, T = 10, B = 24;
+  const x = t => L + (t - t0) / (t1 - t0) * (W - L - R);
+  const y = v => T + (1 - (v - vmin) / (vmax - vmin)) * (H - T - B);
+  const step = key => pts.map((q, i) => {
+    const nx = i + 1 < pts.length ? pts[i + 1].t : t1;
+    return `${i ? "L" : "M"}${x(q.t)},${y(q[key])} L${x(nx)},${y(q[key])}`;
+  }).join(" ");
+  const ticks = [0, .5, 1].map(f => vmin + f * (vmax - vmin) / 1.08);
+  const grid = ticks.map(v => `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="var(--border)"/>` +
+    `<text x="${L - 6}" y="${y(v) + 3}" text-anchor="end">${money(Math.round(v))}</text>`).join("");
+  const dots = pts.map(q => `<circle cx="${x(q.t)}" cy="${y(q.v)}" r="3" fill="${q.promo ? "var(--warn)" : "var(--accent)"}"><title>${when(q.t)} · ${money(q.v)}${q.r > q.v ? " (lista " + money(q.r) + ")" : ""}</title></circle>`).join("");
+  return `<svg class="chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Historial de precio">
+    ${grid}
+    <path d="${step("r")}" fill="none" stroke="var(--muted)" stroke-dasharray="4 3" stroke-width="1.2"/>
+    <path d="${step("v")}" fill="none" stroke="var(--accent)" stroke-width="2"/>
+    ${dots}
+    <text x="${L}" y="${H - 6}">${when(t0)}</text><text x="${W - R}" y="${H - 6}" text-anchor="end">ahora</text>
+  </svg>
+  <div class="muted" style="font-size:12px">— precio · - - precio de lista · ${hist.length} cambio(s) registrados</div>`;
+}
+
+init();
+</script>
+</body>
+</html>
+"""
+
+if __name__ == "__main__":
+    main()
