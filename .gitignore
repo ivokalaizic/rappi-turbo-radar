@@ -3,3 +3,6 @@ config.json
 __pycache__/
 *.pyc
 .claude/
+node_modules/
+.vercel/
+.env*.local

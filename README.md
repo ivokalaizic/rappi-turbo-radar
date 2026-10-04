@@ -27,8 +27,10 @@ Para sacar la lat/lng de una dirección: Google Maps → click derecho sobre el 
 
 ## Reglas de detección (`config.json` → `rules`)
 
-Solo se evalúan productos **nuevos o que cambiaron de precio** en la corrida, así que un mismo
-hallazgo no se repite cada 15 minutos. Además, cada alerta se emite una sola vez por producto y precio.
+Solo se evalúan productos **nuevos o que cambiaron** en la corrida. Cada hallazgo se avisa **una vez
+mientras dure**: si el precio se reajusta un poco (Rappi mueve ±1–2 % miles de productos por día) no se
+repite; solo se vuelve a avisar si baja más de `realertar_si_baja` (5 %) respecto del último aviso, o si
+la oferta terminó (el precio subió) y más adelante vuelve.
 
 | Regla | Dispara cuando | Default |
 |---|---|---|
@@ -37,8 +39,14 @@ hallazgo no se repite cada 15 minutos. Además, cada alerta se emite una sola ve
 | `descuento_extremo` | precio ≤ X × precio de lista (tachado) | 0.2 |
 | `vs_otras_tiendas` | precio ≤ X × mediana del mismo producto en otras tiendas Turbo | 0.5 |
 | `gran_descuento` | oferta fuerte (no es error): precio ≤ X × precio de lista | 0.5 |
+| `nuevo_vs_pasillo` | producto **sin historial** (nuevo): precio por kg/L ≤ X × el de los más baratos (percentil 10) de su sub-pasillo | 0.2 |
 
-Productos sin stock no alertan.
+`caida_vs_historial` necesita historia propia; `nuevo_vs_pasillo` cubre a los productos nuevos. Solo usa
+peso y volumen (las "Und" no son comparables) y sub-pasillos con 8+ productos. Con 0.2 no dispara con
+ningún producto del catálogo actual y detecta aproximadamente la mitad de los precios con un cero de menos.
+
+Productos sin stock no alertan. Los que **desaparecen del catálogo** (Rappi saca lo que se queda sin
+stock) se marcan sin stock en la primera corrida completa en que no vienen; si vuelven, se evalúan de nuevo.
 
 **Promos para usuarios nuevos**: los productos con "Máx. 1 Ud." (p. ej. palta o huevos a $1) son promos
 de bienvenida que **no aplican a cuentas existentes** (verificado con una cuenta real). Se excluyen
@@ -75,8 +83,9 @@ cron unos minutos.
 
 Todo queda en `data/` (ignorado por git):
 
-- `turbo.db` (SQLite): `products` (estado actual), `price_changes` (historial, una fila por cambio),
-  `alerts`, `runs`, `locations`.
+- `turbo.db` (SQLite): `products` (estado actual), `price_changes` (historial: una fila por cambio
+  de precio, precio de lista, promo o stock), `alerts` (log de avisos), `alert_state` (hallazgos
+  vigentes, para no repetir avisos), `runs`, `locations`.
 - `session.json`: token de invitado (dura 7 días, se renueva solo).
 - `turbo.log`.
 

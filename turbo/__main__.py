@@ -10,7 +10,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from . import api, db, detect, notify
+from . import api, db, detect, export, notify
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
@@ -25,7 +25,10 @@ log = logging.getLogger("turbo")
 def load_config(path: Path) -> dict:
     if not path.exists():
         sys.exit(f"No existe {path}. Copiá config.example.json a config.json y cargá tus direcciones.")
-    return json.loads(path.read_text())
+    cfg = json.loads(path.read_text())
+    # Reglas nuevas toman su default aunque el config (o el secret CONFIG_JSON) no las tenga
+    cfg["rules"] = {**detect.DEFAULT_RULES, **cfg.get("rules", {})}
+    return cfg
 
 
 def resolve_stores(conn, client, locations) -> dict[int, dict]:
@@ -85,14 +88,19 @@ def scrape_store(conn, client, store_id, s, cfg, on_product=None) -> list[dict]:
         status = f"error: {e}"
         log.error("tienda %s: %s", store_id, e)
 
-    # Una corrida muy incompleta no debe pisar el estado (evita falsos "nuevos")
-    known = conn.execute("SELECT COUNT(*) FROM products WHERE store_id=?", (store_id,)).fetchone()[0]
+    # Una corrida muy incompleta no debe pisar el estado (evita falsos "nuevos" y "desaparecidos").
+    # Se compara con lo que vino en la última corrida guardada, no con todo lo visto alguna vez.
+    known = conn.execute("SELECT COUNT(*) FROM products WHERE store_id=? AND last_seen="
+                         "(SELECT MAX(last_seen) FROM products WHERE store_id=?)", (store_id, store_id)).fetchone()[0]
+    now, gone = int(time.time()), 0
     if known and len(rows) < known * 0.5:
         status = f"incompleta: {len(rows)} de ~{known}"
         log.error("tienda %s %s, no guardo", store_id, status)
         changed = []
     else:
-        changed = db.upsert_products(conn, rows)
+        changed = db.upsert_products(conn, rows, now)
+        if status == "ok":
+            gone = db.mark_missing(conn, store_id, now, client.failed)
 
     findings = detect.evaluate(conn, changed, cfg["rules"], cfg.get("include_new_user_promos", False))
     conn.execute("INSERT INTO runs (store_id, started, finished, products, changed, requests, errors, status) "
@@ -100,8 +108,8 @@ def scrape_store(conn, client, store_id, s, cfg, on_product=None) -> list[dict]:
                  (store_id, started, int(time.time()), len(rows), len(changed),
                   client.requests - req0, client.errors - err0, status))
     conn.commit()
-    log.info("tienda %s (%s): %d productos, %d cambios, %d alertas nuevas, %d requests, %ds — %s",
-             store_id, ", ".join(s["locations"]), len(rows), len(changed), len(findings),
+    log.info("tienda %s (%s): %d productos, %d cambios, %d desaparecidos, %d alertas nuevas, %d requests, %ds — %s",
+             store_id, ", ".join(s["locations"]), len(rows), len(changed), gone, len(findings),
              client.requests - req0, int(time.time()) - started, status)
     return findings
 
@@ -173,6 +181,12 @@ def cmd_alerts(args, cfg):
         print(f"Sin alertas en las últimas {args.hours} h.")
 
 
+def cmd_export(args, cfg):
+    conn = db.connect(DATA / "turbo.db")
+    for path in export.export(conn, cfg, args.out):
+        print(f"{path} ({path.stat().st_size // 1024} KB)")
+
+
 def cmd_notify_test(args, cfg):
     ok = notify.test(cfg)
     if not ok:
@@ -190,6 +204,8 @@ def main():
                        help="guarda el catálogo y las alertas sin avisar (primera corrida con base vacía)")
     sub.add_parser("stores", help="muestra qué tienda Turbo atiende cada dirección")
     sub.add_parser("notify-test", help="manda un mensaje de prueba por Telegram")
+    p_export = sub.add_parser("export", help="deja el resumen de cada tienda en archivos para la UI en la nube")
+    p_export.add_argument("--out", type=Path, default=DATA / "export")
     p_alerts = sub.add_parser("alerts", help="lista las alertas recientes")
     p_alerts.add_argument("--hours", type=int, default=24)
     args = parser.parse_args()
@@ -201,7 +217,8 @@ def main():
         handlers=[logging.StreamHandler(), logging.FileHandler(DATA / "turbo.log")],
     )
     cfg = load_config(args.config)
-    {"run": cmd_run, "stores": cmd_stores, "alerts": cmd_alerts, "notify-test": cmd_notify_test}[args.cmd](args, cfg)
+    {"run": cmd_run, "stores": cmd_stores, "alerts": cmd_alerts, "notify-test": cmd_notify_test,
+     "export": cmd_export}[args.cmd](args, cfg)
 
 
 if __name__ == "__main__":

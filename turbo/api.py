@@ -39,6 +39,7 @@ class Client:
         self.delay_s = delay_s
         self.requests = 0
         self.errors = 0
+        self.failed: set = set()  # pasillos y (pasillo, sub-pasillo) que fallaron en el último crawl
         try:
             self.session = json.loads(self.session_path.read_text())
         except (FileNotFoundError, json.JSONDecodeError):
@@ -159,19 +160,23 @@ class Client:
             offset += 50
 
     def crawl(self, store_id, lat, lng):
-        """Recorre la tienda entera. Genera (pasillo, sub-pasillo, producto)."""
+        """Recorre la tienda entera. Genera (pasillo, sub-pasillo, producto).
+        Lo que falla se saltea y queda anotado en `self.failed`."""
         seen = set()
+        self.failed = set()
         for aisle in self.aisles(store_id, lat, lng):
             try:
                 subs = self.subaisles(store_id, lat, lng, aisle["id"])
             except RappiError as e:
                 log.warning("pasillo %s falló: %s", aisle.get("name"), e)
+                self.failed.add(aisle["name"])
                 continue
             for sub in subs:
                 try:
                     products = self.subaisle_products(store_id, lat, lng, aisle["id"], sub["id"], sub.get("product_count") or 0)
                 except RappiError as e:
                     log.warning("sub-pasillo %s/%s falló: %s", aisle.get("name"), sub.get("name"), e)
+                    self.failed.add((aisle["name"], sub.get("name")))
                     continue
                 for pid, p in products.items():
                     if pid not in seen:

@@ -1,8 +1,11 @@
 """Persistencia en SQLite.
 
 - products:      último estado conocido de cada producto por tienda
-- price_changes: una fila cada vez que cambia el precio (no en cada corrida)
-- alerts:        hallazgos ya emitidos (sirve para no repetir avisos)
+- price_changes: historial, una fila cada vez que cambia precio, precio de lista, promo o stock
+                 (no en cada corrida); "sin stock" incluye desaparecer del catálogo
+- alerts:        log de hallazgos emitidos
+- alert_state:   hallazgo vigente por (tienda, producto, regla): evita repetir el aviso
+                 mientras dura la misma oferta o error de precio
 """
 
 import sqlite3
@@ -34,9 +37,30 @@ CREATE TABLE IF NOT EXISTS runs (
 CREATE TABLE IF NOT EXISTS alerts (
     id INTEGER PRIMARY KEY, ts INTEGER, store_id INTEGER, product_id TEXT, rule TEXT,
     price REAL, ref_price REAL, ratio REAL, name TEXT, url TEXT, detail TEXT,
-    notified INTEGER DEFAULT 0,
-    UNIQUE (store_id, product_id, rule, price)
+    notified INTEGER DEFAULT 0
 );
+CREATE INDEX IF NOT EXISTS alerts_product ON alerts (store_id, product_id, rule, ts);
+CREATE TABLE IF NOT EXISTS alert_state (
+    store_id INTEGER, product_id TEXT, rule TEXT, price REAL, ts INTEGER,
+    PRIMARY KEY (store_id, product_id, rule)
+);
+"""
+
+# Hasta 2026-10 las alertas eran únicas por precio exacto: cada reajuste de ±1 % de Rappi
+# volvía a avisar la misma oferta. Ahora la deduplicación vive en alert_state.
+MIGRATE_ALERTS = """
+BEGIN;
+ALTER TABLE alerts RENAME TO alerts_old;
+CREATE TABLE alerts (
+    id INTEGER PRIMARY KEY, ts INTEGER, store_id INTEGER, product_id TEXT, rule TEXT,
+    price REAL, ref_price REAL, ratio REAL, name TEXT, url TEXT, detail TEXT,
+    notified INTEGER DEFAULT 0
+);
+INSERT INTO alerts SELECT * FROM alerts_old;
+DROP TABLE alerts_old;
+CREATE INDEX IF NOT EXISTS alerts_product ON alerts (store_id, product_id, rule, ts);
+INSERT OR REPLACE INTO alert_state SELECT store_id, product_id, rule, price, ts FROM alerts ORDER BY ts;
+COMMIT;
 """
 
 TRACKED = ("price", "real_price", "global_offer", "in_stock")
@@ -50,6 +74,8 @@ def connect(path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=5000")
     conn.executescript(SCHEMA)
+    if "UNIQUE" in conn.execute("SELECT sql FROM sqlite_master WHERE name='alerts'").fetchone()[0]:
+        conn.executescript(MIGRATE_ALERTS)
     if "covered" not in {r[1] for r in conn.execute("PRAGMA table_info(locations)")}:
         conn.execute("ALTER TABLE locations ADD COLUMN covered INTEGER DEFAULT 1")
     return conn
@@ -77,10 +103,9 @@ def normalize(store_id: int, aisle: str, subaisle: str, p: dict) -> dict:
     }
 
 
-def upsert_products(conn, rows: list[dict], now: int | None = None) -> list[dict]:
+def upsert_products(conn, rows: list[dict], now: int) -> list[dict]:
     """Guarda el estado actual. Devuelve los productos nuevos o con cambios,
     cada uno con `prev_price` (None si es nuevo)."""
-    now = now or int(time.time())
     changed = []
     for r in rows:
         old = conn.execute(
@@ -110,32 +135,46 @@ def upsert_products(conn, rows: list[dict], now: int | None = None) -> list[dict
     return changed
 
 
+def mark_missing(conn, store_id: int, now: int, failed: set) -> int:
+    """Productos que no vinieron en una corrida completa: Rappi saca del catálogo lo que se queda
+    sin stock, así que se marcan sin stock (y queda en el historial). Si vuelven, el cambio
+    in_stock 0→1 hace que se evalúen de nuevo. `failed`: pasillos y (pasillo, sub-pasillo) que
+    fallaron en esta corrida; sus productos no se tocan porque no sabemos si siguen."""
+    gone = [r for r in conn.execute(
+        "SELECT * FROM products WHERE store_id=? AND last_seen<? AND in_stock=1", (store_id, now))
+        if r["aisle"] not in failed and (r["aisle"], r["subaisle"]) not in failed]
+    for r in gone:
+        conn.execute("INSERT INTO price_changes VALUES (?,?,?,?,?,?,?)",
+                     (store_id, r["product_id"], now, r["price"], r["real_price"], r["global_offer"], 0))
+        conn.execute("UPDATE products SET in_stock=0 WHERE store_id=? AND product_id=?", (store_id, r["product_id"]))
+    conn.commit()
+    return len(gone)
+
+
 def typical_price(conn, store_id: int, product_id: str, days: int, now: int | None = None) -> float | None:
     """Precio que el producto mantuvo más tiempo en los últimos `days` días,
     sin contar el tramo actual. None si no hay historial previo."""
     now = now or int(time.time())
     rows = conn.execute(
-        """SELECT ts, price FROM price_changes
-           WHERE store_id=? AND product_id=? AND global_offer=0 AND ts <= ?
-           ORDER BY ts""",
+        """SELECT ts, price, global_offer, in_stock FROM price_changes
+           WHERE store_id=? AND product_id=? AND ts <= ? ORDER BY ts""",
         (store_id, product_id, now),
     ).fetchall()
     return typical_from_changes(rows, days, now)
 
 
 def typical_from_changes(rows, days: int, now: int) -> float | None:
-    """`rows`: cambios (ts, price) ordenados, sin promos; el último es el precio actual."""
+    """`rows`: todos los cambios (ts, price, global_offer, in_stock) ordenados; el último es el
+    estado actual y no cuenta. Tampoco cuentan los tramos de promo para usuarios nuevos ni los
+    sin stock: ese precio no estaba realmente a la venta."""
     since = now - days * 86400
-    # el último registro es el precio actual: lo excluimos
-    rows = rows[:-1] if rows else rows
-    if not rows:
-        return None
     held: dict[float, float] = {}
-    boundaries = [r["ts"] for r in rows[1:]] + [now]
-    for r, end in zip(rows, boundaries):
+    for r, nxt in zip(rows, rows[1:]):
+        if r["global_offer"] or not r["in_stock"]:
+            continue
         start = max(r["ts"], since)
-        if end > start:
-            held[r["price"]] = held.get(r["price"], 0) + (end - start)
+        if nxt["ts"] > start:
+            held[r["price"]] = held.get(r["price"], 0) + (nxt["ts"] - start)
     return max(held, key=held.get) if held else None
 
 
@@ -155,12 +194,29 @@ def other_stores_median(conn, master_product_id, store_id) -> tuple[float | None
     return median, len(prices)
 
 
-def save_alert(conn, a: dict) -> bool:
-    """True si la alerta es nueva (no se había emitido para ese precio)."""
-    cur = conn.execute(
-        """INSERT OR IGNORE INTO alerts (ts, store_id, product_id, rule, price, ref_price, ratio, name, url, detail)
+def save_alert(conn, a: dict, realert_drop: float) -> bool:
+    """Guarda la alerta si es un hallazgo nuevo. Si esa regla ya está vigente para el producto,
+    solo se vuelve a avisar cuando el precio baja más de `realert_drop` (0.05 = 5 %) respecto
+    del último aviso. True si se guardó."""
+    prev = conn.execute("SELECT price FROM alert_state WHERE store_id=? AND product_id=? AND rule=?",
+                        (a["store_id"], a["product_id"], a["rule"])).fetchone()
+    if prev and a["price"] >= prev["price"] * (1 - realert_drop):
+        return False
+    conn.execute(
+        """INSERT INTO alerts (ts, store_id, product_id, rule, price, ref_price, ratio, name, url, detail)
            VALUES (:ts,:store_id,:product_id,:rule,:price,:ref_price,:ratio,:name,:url,:detail)""",
         a,
     )
+    conn.execute("INSERT OR REPLACE INTO alert_state VALUES (?,?,?,?,?)",
+                 (a["store_id"], a["product_id"], a["rule"], a["price"], a["ts"]))
     conn.commit()
-    return cur.rowcount == 1
+    return True
+
+
+def close_alerts(conn, store_id: int, product_id: str, price: float, keep: set[str], margin: float):
+    """El producto se evaluó y ya no dispara estas reglas: la oferta o el error terminó, y si vuelve
+    a pasar más adelante se avisa de nuevo. Para no cerrar y reabrir cuando el precio baila alrededor
+    del umbral (p. ej. 0,502 vs 0,5), solo se cierra si además subió más de `margin` sobre el aviso."""
+    conn.execute(f"""DELETE FROM alert_state WHERE store_id=? AND product_id=? AND price * ? < ?
+                     AND rule NOT IN ({",".join("?" * len(keep))})""",
+                 (store_id, product_id, 1 + margin, price, *keep))

@@ -15,7 +15,9 @@
     "descuento_extremo": 0.2,
     "vs_otras_tiendas": 0.5,
     "historial_dias": 14,
-    "gran_descuento": 0.5
+    "gran_descuento": 0.5,
+    "nuevo_vs_pasillo": 0.2,
+    "realertar_si_baja": 0.05
   },
   "notify": {
     "macos": true,

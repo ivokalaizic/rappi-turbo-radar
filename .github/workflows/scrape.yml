@@ -73,6 +73,18 @@ jobs:
             python3 -m turbo run --baseline
           fi
 
+      # Resumen sin direcciones para la UI en Vercel (web/). Si falla, el scraper y los avisos siguen igual.
+      - name: Publicar resumen para la UI
+        if: always() && hashFiles('data/turbo.db') != ''
+        continue-on-error: true
+        env:
+          BLOB_READ_WRITE_TOKEN: ${{ secrets.BLOB_READ_WRITE_TOKEN }}
+        run: |
+          test -n "$BLOB_READ_WRITE_TOKEN" || { echo "Sin secret BLOB_READ_WRITE_TOKEN, no publico"; exit 0; }
+          python3 -m turbo export --out data/export
+          npm ci --prefix web --silent
+          node web/scripts/upload.mjs data/export
+
       - name: Guardar estado
         if: always() && hashFiles('data/turbo.db') != ''
         uses: actions/cache/save@v4
