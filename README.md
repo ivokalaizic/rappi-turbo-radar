@@ -93,8 +93,10 @@ e ilimitado si el repo es **público**; las direcciones y el token de Telegram v
    (`--baseline`); desde la segunda llegan los avisos por Telegram.
 
 El estado (`turbo.db`, `session.json`) queda en el cache de Actions, que no es público. Los logs
-sí lo son: el workflow oculta nombres y coordenadas de las direcciones. GitHub puede atrasar el
-cron unos minutos.
+sí lo son: el workflow oculta nombres y coordenadas de las direcciones. GitHub atrasa o saltea el cron
+cuando está cargado, así que el disparador principal es externo: un job de [cron-job.org](https://cron-job.org)
+que cada 15 min hace `POST https://api.github.com/repos/<usuario>/<repo>/actions/workflows/scrape.yml/dispatches`
+con body `{"ref":"main"}` y un token *fine-grained* con permiso **Actions: Read and write** solo sobre este repo.
 
 ## Datos
 

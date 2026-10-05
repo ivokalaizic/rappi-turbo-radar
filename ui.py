@@ -689,6 +689,8 @@ function tick() {
   if (!SCHED.interval) { el.textContent = "monitoreo automático no instalado"; return; }
   if (SCHED.running) { el.textContent = "corriendo ahora…"; return; }
   const left = Math.round(SCHED.last_start + SCHED.interval - Date.now() / 1000);
+  // Más de 5 min de atraso: avisarlo en vez de prometer una corrida que no llega
+  if (left < -300) { el.textContent = `⚠ la corrida está atrasada ${Math.round(-left / 60)} min`; return; }
   if (left <= 0) { el.textContent = "próxima corrida en cualquier momento"; return; }
   const m = Math.floor(left / 60), s = String(left % 60).padStart(2, "0");
   el.textContent = `próxima corrida en ${m}:${s}`;
