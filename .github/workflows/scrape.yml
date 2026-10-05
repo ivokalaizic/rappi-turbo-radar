@@ -5,7 +5,10 @@ name: scrape
 
 on:
   schedule:
-    - cron: "*/15 * * * *"  # GitHub puede atrasarlo unos minutos
+    # Respaldo: GitHub atrasa o saltea los cron cuando está cargado (en oct-2026 corría cada ~3 h).
+    # El disparador principal es cron-job.org, que llama a workflow_dispatch cada 15 min.
+    # Minutos "raros" para esquivar los picos de :00/:15/:30/:45.
+    - cron: "7,22,37,52 * * * *"
   workflow_dispatch:
     inputs:
       prueba_aviso:
